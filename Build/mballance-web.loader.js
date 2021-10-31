@@ -208,10 +208,10 @@ function createUnityInstance(canvas, config, onProgress) {
       hasFullscreen: !!document.body.requestFullscreen,
       hasThreads: hasThreads,
       hasWasm: hasWasm,
-      hasWasmThreads: (function() {
-        var wasmMemory = hasWasm && hasThreads && new WebAssembly.Memory({"initial": 1, "maximum": 1, "shared": true});
-        return wasmMemory && wasmMemory.buffer instanceof SharedArrayBuffer;
-      })(),
+      // This should be updated when we re-enable wasm threads. Previously it checked for WASM thread
+      // support with: var wasmMemory = hasWasm && hasThreads && new WebAssembly.Memory({"initial": 1, "maximum": 1, "shared": true});
+      // which caused Chrome to have a warning that SharedArrayBuffer requires cross origin isolation.
+      hasWasmThreads: false,
     };
   })();
 
@@ -326,7 +326,7 @@ function createUnityInstance(canvas, config, onProgress) {
         while (cache.queue.length) {
           var queued = cache.queue.shift();
           if (cache.database) {
-            cache.execute.apply(cache, queued);
+            cache.execute.apply(cache, queued.arguments);
           } else if (typeof queued.onerror == "function") {
             queued.onerror(new Error("operation cancelled"));
           }
@@ -345,12 +345,25 @@ function createUnityInstance(canvas, config, onProgress) {
           openRequest.onsuccess = function (e) { initDatabase(e.target.result); };
           openRequest.onerror = function () { initDatabase(null); };
         }
+
+        // Workaround for WebKit bug 226547:
+        // On very first page load opening a connection to IndexedDB hangs without triggering onerror.
+        // Add a timeout that triggers the error handling code.
+        var indexedDBTimeout = setTimeout(function () {
+          if (typeof cache.database != "undefined")
+            return;
+          
+          initDatabase(null);  
+        }, 2000);
+
         var openRequest = indexedDB.open(UnityCacheDatabase.name);
         openRequest.onupgradeneeded = function (e) {
           var objectStore = e.target.result.createObjectStore(XMLHttpRequestStore.name, { keyPath: "url" });
           ["version", "company", "product", "updated", "revalidated", "accessed"].forEach(function (index) { objectStore.createIndex(index, index); });
         };
         openRequest.onsuccess = function (e) {
+          clearTimeout(indexedDBTimeout);
+
           var database = e.target.result;
           if (database.version < UnityCacheDatabase.version) {
             database.close();
@@ -359,8 +372,12 @@ function createUnityInstance(canvas, config, onProgress) {
             initDatabase(database);
           }
         };
-        openRequest.onerror = function () { initDatabase(null); };
+        openRequest.onerror = function () {
+          clearTimeout(indexedDBTimeout);
+          initDatabase(null);
+        };
       } catch (e) {
+        clearTimeout(indexedDBTimeout);
         initDatabase(null);
       }
     };
@@ -382,7 +399,10 @@ function createUnityInstance(canvas, config, onProgress) {
             onerror(e);
         }
       } else if (typeof this.database == "undefined") {
-        this.queue.push(arguments);
+        this.queue.push({
+          arguments: arguments,
+          onerror: onerror
+        });
       } else if (typeof onerror == "function") {
         onerror(new Error("indexedDB access denied"));
       }
